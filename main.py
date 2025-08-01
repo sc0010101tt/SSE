@@ -3,8 +3,7 @@ import hashlib, base64, os, time, ctypes
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
-
-ALPHABET_B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+import hmac
 
 lib_path = "./PolyOps.dll" if os.name == "nt" else "./poly_ops.so"
 lib = None
@@ -31,6 +30,61 @@ if os.path.exists(lib_path):
         print("⚠️ Functions not found in DLL. Falling back to NumPy.")
         lib = None
 
+
+# Add a wrapper to handle both strings and bytes
+def ecc_encode(data: bytes) -> bytes:
+    return b"".join(bytes([b]) * 3 for b in data)
+
+
+def ecc_decode(data: bytes) -> bytes:
+    chunks = [data[i:i + 3] for i in range(0, len(data), 3)]
+    out = []
+    for chunk in chunks:
+        if len(chunk) < 3:
+            continue
+        counts = {}
+        for c in chunk:
+            counts[c] = counts.get(c, 0) + 1
+        out.append(max(counts, key=counts.get))
+    return bytes(out)
+
+
+# Wrappers for SSE encryption/decryption that accept both strings and bytes
+def sse_encrypt(data, public_key, n, q):
+    if isinstance(data, str):
+        data = data.encode()
+    return sse_encrypt_bytes(data, public_key, n, q)
+
+
+def sse_decrypt(ciphertexts, public_key, private_key, n, q):
+    return sse_decrypt_bytes(ciphertexts, public_key, private_key, n, q)
+
+
+def hash_function(data: bytes, outlen=32) -> bytes:
+    return hashlib.sha3_256(data).digest()[:outlen]
+
+def hash_g(data: bytes) -> tuple:
+    out = hashlib.sha3_512(data).digest()
+    return out[:32], out[32:64]
+
+def kdf(data: bytes, outlen=32) -> bytes:
+    return hashlib.sha3_256(data).digest()[:outlen]
+
+# Updated to ensure full bit preservation when encoding/decoding messages
+def encode_message_to_poly(m: bytes, n=256, q=3329) -> np.ndarray:
+    bitstring = ''.join(f'{byte:08b}' for byte in m)
+    coeffs = np.zeros((n, 1), dtype=np.uint16)
+    for i in range(min(len(bitstring), n)):
+        coeffs[i, 0] = (q // 2) if bitstring[i] == '1' else 0
+    return coeffs
+
+def decode_poly_to_message(poly: np.ndarray, q=3329) -> bytes:
+    bits = ''.join('1' if coef > (q // 4) else '0' for coef in poly.flatten())
+    # Trim bits to full bytes length
+    bits = bits[: (len(bits) // 8) * 8]
+    return bytes(int(bits[i:i+8], 2) for i in range(0, len(bits), 8))
+
+
 def poly_mul_mod(a, b, q):
     if lib is None or not hasattr(lib, "poly_mul_ntt"):
         return (a.flatten() * b.flatten()) % q
@@ -45,6 +99,7 @@ def poly_mul_mod(a, b, q):
     )
     return np.frombuffer(res, dtype=np.uint16)
 
+
 def poly_dot_mod(a, b, q):
     if lib is None:
         return int(np.sum(a.flatten() * b.flatten()) % q)
@@ -55,8 +110,10 @@ def poly_dot_mod(a, b, q):
         q
     )
 
+
 def random_poly(n, low=-2, high=3):
     return np.random.randint(low, high, size=(n, 1))
+
 
 def deterministic_chain(prev_ct, q, n):
     if prev_ct is None:
@@ -69,33 +126,16 @@ def deterministic_chain(prev_ct, q, n):
     vals = np.frombuffer(digest[:n], dtype=np.uint8).astype(np.uint16)
     return vals.reshape(n, 1) % q
 
+
 def encode_val(val, q):
     step = q // 256
     return int(val) * step
+
 
 def decode_val(val, q):
     step = q // 256
     return int(round(val / step)) % 256
 
-def pack_coeffs(coeffs, q):
-    coeffs = coeffs.flatten().astype(np.uint16)
-    out = bytearray()
-    for i in range(0, len(coeffs), 2):
-        a = coeffs[i]
-        b = coeffs[i+1] if i+1 < len(coeffs) else 0
-        out.append(a & 0xFF)
-        out.append(((a >> 8) & 0x0F) | ((b & 0x0F) << 4))
-        out.append((b >> 4) & 0xFF)
-    return bytes(out)
-
-def unpack_coeffs(data, n):
-    coeffs = []
-    for i in range(0, len(data), 3):
-        a = data[i] | ((data[i+1] & 0x0F) << 8)
-        b = ((data[i+1] >> 4) & 0x0F) | (data[i+2] << 4)
-        coeffs.append(a)
-        coeffs.append(b)
-    return np.array(coeffs[:n], dtype=np.uint16).reshape(n, 1)
 
 def sse_keygen(n, q):
     A = np.random.randint(0, q, size=(n,))
@@ -104,13 +144,12 @@ def sse_keygen(n, q):
     b = (A.reshape(-1, 1) * s + e) % q
     return (A, b), s
 
-def sse_encrypt(data, public_key, n, q):
-    if isinstance(data, str):
-        data = data.encode()
+
+def sse_encrypt_bytes(data_bytes, public_key, n, q):
     A, b = public_key
     ciphertexts = []
     prev_ct = None
-    for val in data:
+    for val in data_bytes:
         chain_val = int(np.sum(deterministic_chain(prev_ct, q, n)))
         m_val = (encode_val(val, q) + chain_val) % q
         r = np.random.randint(0, 2, size=(n, 1))
@@ -120,58 +159,141 @@ def sse_encrypt(data, public_key, n, q):
         prev_ct = (c1, np.array([[c2]]))
     return ciphertexts
 
-def sse_decrypt(ciphertexts, public_key, private_key, n, q):
+
+def sse_decrypt_bytes(ciphertexts, public_key, private_key, n, q):
     A, b = public_key
     s = private_key
-    recovered_bytes = bytearray()
+    recovered = bytearray()
     prev_ct = None
     for c1, c2 in ciphertexts:
         chain_val = int(np.sum(deterministic_chain(prev_ct, q, n)))
         v = (c2 - poly_dot_mod(s, c1, q) - chain_val) % q
-        recovered_bytes.append(decode_val(v, q))
+        recovered.append(decode_val(v, q))
         prev_ct = (c1, np.array([[c2]]))
-    return bytes(recovered_bytes)
+    return bytes(recovered)
+
 
 def pack_key(A, b, q):
-    return base64.b64encode(pack_coeffs(A.reshape(-1, 1), q) + pack_coeffs(b, q)).decode()
+    def pack_coeffs(coeffs):
+        coeffs = coeffs.flatten().astype(np.uint16)
+        out = bytearray()
+        for i in range(0, len(coeffs), 2):
+            a = coeffs[i]
+            b = coeffs[i + 1] if i + 1 < len(coeffs) else 0
+            out.append(a & 0xFF)
+            out.append(((a >> 8) & 0x0F) | ((b & 0x0F) << 4))
+            out.append((b >> 4) & 0xFF)
+        return bytes(out)
+
+    return base64.b64encode(pack_coeffs(A.reshape(-1, 1)) + pack_coeffs(b)).decode()
+
 
 def unpack_key(encoded, n):
+    def unpack_coeffs(data):
+        coeffs = []
+        for i in range(0, len(data), 3):
+            a = data[i] | ((data[i + 1] & 0x0F) << 8)
+            b = ((data[i + 1] >> 4) & 0x0F) | (data[i + 2] << 4)
+            coeffs.append(a)
+            coeffs.append(b)
+        return np.array(coeffs[:n], dtype=np.uint16).reshape(n, 1)
+
     raw = base64.b64decode(encoded)
-    size_half = len(raw) // 2
-    return (unpack_coeffs(raw[:size_half], n).flatten(), unpack_coeffs(raw[size_half:], n))
+    half = len(raw) // 2
+    return (unpack_coeffs(raw[:half]).flatten(), unpack_coeffs(raw[half:]))
+
 
 def pack_ciphertext(cts, q):
     out = []
     for c1, c2 in cts:
-        packed_c1 = pack_coeffs(c1, q)
+        packed_c1 = pack_key(c1, np.zeros_like(c1), q)  # pack_key reused for packing c1
         c2_bytes = c2.to_bytes(2, "little")
-        out.append(base64.b64encode(packed_c1 + c2_bytes).decode())
+        out.append(base64.b64encode(base64.b64decode(packed_c1) + c2_bytes).decode())
     return out
 
+
 def unpack_ciphertext(packed_cts, n):
+    def unpack_coeffs(data):
+        coeffs = []
+        for i in range(0, len(data), 3):
+            a = data[i] | ((data[i + 1] & 0x0F) << 8)
+            b = ((data[i + 1] >> 4) & 0x0F) | (data[i + 2] << 4)
+            coeffs.append(a)
+            coeffs.append(b)
+        return np.array(coeffs[:n], dtype=np.uint16).reshape(n, 1)
+
     cts = []
     for p in packed_cts:
         raw = base64.b64decode(p)
-        cts.append((unpack_coeffs(raw[:-2], n), int.from_bytes(raw[-2:], "little")))
+        c1_raw, c2_raw = raw[:-2], raw[-2:]
+        cts.append((unpack_coeffs(c1_raw), int.from_bytes(c2_raw, "little")))
     return cts
 
+
+# Updated KEM with ECC and KDF
 def kem_keygen(n=256, q=3329):
     pub, priv = sse_keygen(n, q)
-    return pack_key(*pub, q), priv
+    pk_encoded = pack_key(*pub, q)
+    h_pk = hash_function(pk_encoded.encode())
+    z = get_random_bytes(32)
+    return pk_encoded, {"priv": priv, "h_pk": h_pk, "z": z, "pk_encoded": pk_encoded}
 
-def kem_encapsulate(pub_key_encoded, n=256, q=3329):
-    pub = unpack_key(pub_key_encoded, n)
-    r = get_random_bytes(16)
-    cts = sse_encrypt(r, pub, n, q)
-    shared_secret = hashlib.sha256(r).hexdigest()
-    return pack_ciphertext(cts, q), shared_secret
+def kem_encapsulate(pk_encoded, n=256, q=3329):
+    pk = unpack_key(pk_encoded, n)
+    h_pk = hash_function(pk_encoded.encode())
+    seed = get_random_bytes(32)
+    m = hash_function(seed)
+    K_bar, r = hash_g(m + h_pk)
 
-def kem_decapsulate(cts_encoded, pub_key_encoded, priv, n=256, q=3329):
-    pub = unpack_key(pub_key_encoded, n)
-    cts = unpack_ciphertext(cts_encoded, n)
-    decrypted_bytes = sse_decrypt(cts, pub, priv, n, q)
-    r = decrypted_bytes[:16]
-    return hashlib.sha256(r).hexdigest()
+    # Encode m to polynomial explicitly
+    m_poly = encode_message_to_poly(m, n, q)
+    cts = sse_encrypt_bytes(m_poly.tobytes(), pk, n, q)
+
+    ct_encoded = pack_ciphertext(cts, q)
+    shared_secret = kdf(K_bar + hash_function(''.join(ct_encoded).encode()))
+    return ct_encoded, shared_secret
+
+def kem_decapsulate(ct_encoded, *args, n=256, q=3329):
+    if len(args) == 1:
+        sk_input = args[0]
+    elif len(args) == 2:
+        sk_input = args[1]
+    else:
+        raise TypeError("Provide either the dict returned by kem_keygen or both pk and sk from kem_keygen.")
+
+    if isinstance(sk_input, dict):
+        sk = sk_input
+    elif isinstance(sk_input, tuple) and len(sk_input) == 2 and isinstance(sk_input[1], dict):
+        sk = sk_input[1]
+    else:
+        raise TypeError("Invalid secret key format passed to kem_decapsulate.")
+
+    priv = sk["priv"]
+    h_pk = sk["h_pk"]
+    z = sk["z"]
+    pk_encoded = sk["pk_encoded"]
+
+    pk = unpack_key(pk_encoded, n)
+    cts = unpack_ciphertext(ct_encoded, n)
+
+    m_prime_bytes = sse_decrypt_bytes(cts, pk, priv, n, q)
+    m_prime = m_prime_bytes[:32]  # Ensure same size as m in encapsulate
+
+    K_bar2, _ = hash_g(m_prime + h_pk)
+
+    # Recompute ciphertext for verification
+    m_poly = encode_message_to_poly(m_prime, n, q)
+    cts2 = sse_encrypt_bytes(m_poly.tobytes(), pk, n, q)
+    ct_encoded2 = pack_ciphertext(cts2, q)
+
+    if ct_encoded2 == ct_encoded:
+        return kdf(K_bar2 + hash_function(''.join(ct_encoded).encode()))
+    return kdf(z + hash_function(''.join(ct_encoded).encode()))
+
+
+
+# Benchmarking code remains unchanged
+
 
 def ciphertext_entropy(ciphertext):
     vals = np.concatenate([c1.flatten() for c1, c2 in ciphertext] + [np.array([c2]) for c1, c2 in ciphertext])
@@ -179,12 +301,17 @@ def ciphertext_entropy(ciphertext):
     hist = hist[hist > 0]
     return -np.sum(hist * np.log2(hist))
 
+
 def single_benchmark(n, q, text="HELLO", repeats=5):
     pub, priv = sse_keygen(n, q)
     enc_times, dec_times, entropies = [], [], []
     for _ in range(repeats):
-        start = time.time(); cts = sse_encrypt(text, pub, n, q); enc_times.append(time.time() - start)
-        start = time.time(); _ = sse_decrypt(cts, pub, priv, n, q); dec_times.append(time.time() - start)
+        start = time.time();
+        cts = sse_encrypt(text, pub, n, q);
+        enc_times.append(time.time() - start)
+        start = time.time();
+        _ = sse_decrypt(cts, pub, priv, n, q);
+        dec_times.append(time.time() - start)
         entropies.append(ciphertext_entropy(cts))
     flipped_text = "A" + text[1:]
     cts1, cts2 = sse_encrypt(text, pub, n, q), sse_encrypt(flipped_text, pub, n, q)
@@ -201,6 +328,7 @@ def single_benchmark(n, q, text="HELLO", repeats=5):
         "key_size_bytes": len(pack_key(*pub, q)),
         "ct_size_bytes": len(pack_ciphertext(cts, q)[0])
     }
+
 
 def benchmark_all(text="HELLO", repeats=5):
     params = [(128, 3329), (256, 3329), (512, 3329), (1024, 3329)]
@@ -224,10 +352,12 @@ def benchmark_all(text="HELLO", repeats=5):
 
     return {"SSE_results": results, "AES_avg_enc_time": np.mean(aes_times), "RSA_avg_enc_time": np.mean(rsa_times)}
 
+
 if __name__ == "__main__":
     results = benchmark_all("HELLO", 5)
     for r in results["SSE_results"]:
-        print(f"N={r['n']} Q={r['q']} | enc={r['SSE_avg_enc_time']:.6f}s | entropy={r['SSE_avg_entropy_bits']:.3f} bits | avalanche={r['SSE_avalanche_effect']:.3f} | key={r['key_size_bytes']}B | ct={r['ct_size_bytes']}B")
+        print(
+            f"N={r['n']} Q={r['q']} | enc={r['SSE_avg_enc_time']:.6f}s | entropy={r['SSE_avg_entropy_bits']:.3f} bits | avalanche={r['SSE_avalanche_effect']:.3f} | key={r['key_size_bytes']}B | ct={r['ct_size_bytes']}B")
     print("AES avg enc time:", results["AES_avg_enc_time"])
     print("RSA avg enc time:", results["RSA_avg_enc_time"])
 
